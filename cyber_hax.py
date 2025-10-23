@@ -7,10 +7,55 @@ import string
 import sys
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
-
+import threading
+import math
 import pygame
 
+
+
+class Particle:
+    def __init__(self, x, y):
+        self.x = x + random.randint(-20, 20)
+        self.y = y
+        self.radius = random.randint(2, 5)
+        self.alpha = 120
+        self.speed_y = random.uniform(-0.2, -0.5)
+    
+    def update(self):
+        self.y += self.speed_y
+        self.alpha -= 0.3
+    
+    def draw(self, surface):
+        if self.alpha > 0:
+            s = pygame.Surface((self.radius*2, self.radius*2), pygame.SRCALPHA)
+            pygame.draw.circle(s, (200,200,255,int(self.alpha)), (self.radius,self.radius), self.radius)
+            surface.blit(s, (self.x - self.radius, self.y - self.radius))
+
+    def draw_edge(screen, n1, n2, color):
+        pygame.draw.line(screen, color, (n1.x, n1.y), (n2.x, n2.y), 2)
+
+
+def draw_node(screen, x, y, color, pulse):
+    glow = int((math.sin(pulse) + 1) * 50)  # soft oscillation
+    final_color = (min(color[0]+glow,255), min(color[1]+glow,255), min(color[2]+glow,255))
+    pygame.draw.circle(screen, final_color, (x, y), 10 + int(glow/20))
+
 # ----------------------------- Config ---------------------------------
+INTRO_LINES = [
+    "Welcome Aboard the <<RMS Lateron>>",
+    "",
+    "Deep within the ship's metal shell,",
+    "A single <<server>> runs everything from an isolated cabin.",
+    "",
+    "Your objective is simple: <<Shut down the Lateron server>>",
+    "",
+    "But you are not alone.",
+    "Multiple factions are moving through the other cabins,",
+    "All racing to strike the final blow.",
+    "",
+    "You must succeed <<before they do>>.",
+    "The first one to complete the shutdown earns the time needed to <<escape>>",
+]
 
 W, H = 1200, 720  # Default/fallback values
 SIDEBAR_W = 420
@@ -18,34 +63,35 @@ MAP_W = W - SIDEBAR_W
 
 FPS = 60
 
-NODE_COUNT = 32
+NODE_COUNT = random.randint(25, 35)
 EXTRA_EDGES = 18
 MINE_RATIO = 0.12
 LOCK_RATIO = 0.18
 
 NUM_AI = 2
-STUN_TIME = 2.5
+STUN_TIME = 10
 AI_MOVE_COOLDOWN = (0.9, 1.6)   # default AI speed (adjust as you like)
 HUMAN_SCAN_REVEAL_NEIGHBORS = True
 TRAP_LIMIT = 3
 DECOY_LIMIT = 3
 FONT_SIZE = 18
-TITLE_FONT_SIZE = 36
+TITLE_FONT_SIZE = 30
 
-NODE_RADIUS = 11
+NODE_RADIUS = 12
 SERVER_RADIUS = 14
 CURRENT_HALO = 22
-EDGE_THICKNESS = 2
+EDGE_THICKNESS = 5
 
-BG = (10, 12, 16)
+BG = (8, 10, 18)
 MAP_BG = (14, 16, 22)
 FG = (220, 220, 220)
-MUTED = (170, 170, 170)
-ACCENT = (120, 200, 255)
+MUTED = (120, 130, 150)
+ACCENT = (255, 80, 120)
 DANGER = (255, 95, 95)
 LOCKED_COL = (255, 190, 100)
 MINE_COL = (255, 140, 140)
 SERVER_COL = (140, 255, 180)
+
 
 # ------------------------- Data structures ----------------------------
 
@@ -56,9 +102,11 @@ class Node:
     neighbors: Set[int] = field(default_factory=set)
     locked: bool = False
     lock_pw: Optional[str] = None
+    stored_pw: Optional[str] = None  # Password given at another node (Node A
     mine: bool = False
     decoy: bool = False
     server: bool = False
+    collect_pw: Optional[str] = None  # NEW: password you can collect
 
 @dataclass
 class Player:
@@ -70,6 +118,7 @@ class Player:
     traps_left: int = TRAP_LIMIT
     decoys_left: int = DECOY_LIMIT
     alive: bool = True
+    collected_pwds: Dict[int, str] = field(default_factory=dict)  # NEW
 
 @dataclass
 class GameState:
@@ -95,6 +144,7 @@ def generate_graph() -> Dict[int, Node]:
     random.shuffle(remaining)
     connected = {remaining.pop()}
     edges = set()
+
     while remaining:
         a = random.choice(list(connected))
         b = remaining.pop()
@@ -102,7 +152,39 @@ def generate_graph() -> Dict[int, Node]:
         nodes[b].neighbors.add(a)
         edges.add(tuple(sorted((a, b))))
         connected.add(b)
+    # Add extra edges
+        node_ids = list(nodes.keys())
+        attempts = 0
+        while len(edges) < NODE_COUNT - 1 + EXTRA_EDGES and attempts < NODE_COUNT * 10:
+            a, b = random.sample(node_ids, 2)
+            e = tuple(sorted((a, b)))
+            if e not in edges:
+                nodes[a].neighbors.add(b)
+                nodes[b].neighbors.add(a)
+                edges.add(e)
+            attempts += 1
 
+        # Locked nodes
+        specials = list(nodes.keys())
+        random.shuffle(specials)
+        lock_count = int(NODE_COUNT * LOCK_RATIO)
+        mine_count = int(NODE_COUNT * MINE_RATIO)
+        for nid in specials[:lock_count]:
+            pw = ''.join(random.choice(string.ascii_lowercase) for _ in range(4))  # 4-letter password
+            nodes[nid].locked = True
+            nodes[nid].lock_pw = pw
+
+        # Mines
+        mine_targets = [n for n in specials[lock_count:] if not nodes[n].locked]
+        for nid in mine_targets[:mine_count]:
+            nodes[nid].mine = True
+
+        # Collectible passwords
+        collect_nodes = random.sample([n for n in nodes if not nodes[n].locked], k=max(3, NODE_COUNT//6))
+        for nid in collect_nodes:
+            nodes[nid].collect_pw = ''.join(random.choice(string.ascii_lowercase) for _ in range(4))  # 4-letter collectible
+
+        return nodes
     node_ids = list(nodes.keys())
     attempts = 0
     while len(edges) < NODE_COUNT - 1 + EXTRA_EDGES and attempts < NODE_COUNT * 10:
@@ -285,7 +367,7 @@ class RivalAI:
         if target_node.locked and next_step not in gs.global_unlocks:
             # try guess sometimes
             if random.random() < 0.18 and target_node.lock_pw:
-                guess = ''.join(random.choice(string.ascii_lowercase) for _ in range(3))
+                guess = ''.join(random.choice(string.ascii_lowercase) for _ in range(4))
                 if guess == target_node.lock_pw:
                     gs.global_unlocks.add(next_step)
                     gs.log.append(f"{self.p.name} guessed and unlocked node {next_step}.")
@@ -315,11 +397,12 @@ BOOKLET_TEXT = [
     "scan — reveal neighbors of your current node",
     "move <id> — move to adjacent node (if unlocked)",
     "path <id> — shortest path length (if known)",
+    "reveal — temporarily reveal opponent moves for 5 seconds",
+    "collect — collect any password if present in the node",
     "recon <id> — hint (scrambled) to locked node password",
     "unlock <id> <abc> — unlock locked node with 3-letter password",
     "trap — place a one-time stun trap on your current node",
     "decoy — spawn an untrustworthy virtual node (AI bait)",
-    "log — print recent events",
     "quit — exit game",
 ]
 
@@ -382,7 +465,7 @@ def cmd_move(gs: GameState, player: Player, term: Terminal, args):
         return
     if target in gs.traps and gs.traps[target] > 0:
         term.add("You triggered a trap! Stunned.")
-        player.stunned_until = now + STUN_TIME
+        player.stunned_until = now + STUN_TIME+2
         gs.traps[target] -= 1
     if node.mine:
         term.add("You hit a mine! Stunned.")
@@ -406,6 +489,59 @@ def cmd_path(gs: GameState, player: Player, term: Terminal, args):
         term.add("Path unknown.")
     else:
         term.add(f"Shortest path length: {dist} step(s).")
+def cmd_reveal(gs: GameState, player: Player, term: Terminal, *a):
+    """
+    Temporarily shows the positions of opponents and their movement.
+    Only shows undiscovered nodes of opponents for 5 seconds.
+    Can only be used 3 times per player.
+    """
+    # Initialize counter if not present
+    if not hasattr(player, 'reveal_uses'):
+        player.reveal_uses = 0
+
+    # Check limit
+    if player.reveal_uses >= 3:
+        term.add("Reveal has already been used 3 times. Cannot use anymore.")
+        return
+
+    player.reveal_uses += 1
+    term.add(f"Revealing opponents' positions for 5 seconds... (Use {player.reveal_uses}/3)")
+
+    # Collect nodes to reveal: all nodes opponents are currently on
+    reveal_nodes = set()
+    for p in gs.players:
+        if not p.is_human and p.alive:
+            reveal_nodes.add(p.current)
+            reveal_nodes.update(gs.nodes[p.current].neighbors)  # show moves
+
+    # Save previous discovered state
+    saved_discovered = {p.name: set(p.discovered) for p in gs.players}
+
+    # Temporarily mark revealed nodes as discovered
+    human = next(p for p in gs.players if p.is_human)
+    human.discovered.update(reveal_nodes)
+
+    # Hide them after 5 seconds
+    def hide_revealed():
+        pygame.time.wait(5000)
+        human.discovered = saved_discovered[human.name]
+
+    threading.Thread(target=hide_revealed, daemon=True).start()
+def cmd_collect(gs: GameState, player: Player, term: Terminal, *args):
+    """Collect a password from the current node, if available."""
+    cur = player.current
+    node = gs.nodes.get(cur)
+    if not node:
+        term.add("Current node not found.")
+        return
+
+    if getattr(node, "collect_pw", None):  # Check if node has a password to collect
+        player.collected_pwds[cur] = node.collect_pw
+        term.add(f"Collected password '{node.collect_pw}' from node {cur}.")
+        node.collect_pw = None  # Remove after collecting
+        gs.log.append(f"{player.name} collected password from node {cur}.")
+    else:
+        term.add("No password to collect at this node.")
 
 def cmd_recon(gs: GameState, player: Player, term: Terminal, args):
     if not args:
@@ -426,33 +562,34 @@ def cmd_recon(gs: GameState, player: Player, term: Terminal, args):
     scrambled = ''.join(random.sample(n.lock_pw, k=len(n.lock_pw)))
     term.add(f"Recon: password letters are {scrambled} (scrambled).")
 
+
 def cmd_unlock(gs: GameState, player: Player, term: Terminal, args):
     if len(args) != 2:
-        term.add("Usage: unlock <node_id> <abc>")
+        term.add("Usage: unlock <node_id> <password>")
         return
+
     try:
         nid = int(args[0])
     except ValueError:
         term.add("Node id must be an integer.")
         return
+
     guess = args[1].strip().lower()
-    if len(guess) != 3 or any(c not in string.ascii_lowercase for c in guess):
-        term.add("Password must be 3 lowercase letters (e.g., abc).")
-        return
-    if nid not in gs.nodes:
+    node = gs.nodes.get(nid)
+    if not node:
         term.add("No such node.")
         return
-    node = gs.nodes[nid]
     if not node.locked:
-        term.add("That node is not locked.")
+        term.add("Node is not locked.")
         return
+
     if node.lock_pw == guess:
         node.locked = False
         gs.global_unlocks.add(nid)
-        term.add(f"Node {nid} unlocked.")
+        term.add(f"Node {nid} unlocked successfully!")
         gs.log.append(f"{player.name} unlocked node {nid}.")
     else:
-        term.add("Unlock failed.")
+        term.add("Incorrect password. Node remains locked.")
 
 def cmd_trap(gs: GameState, player: Player, term: Terminal, *a):
     if player.traps_left <= 0:
@@ -486,11 +623,12 @@ COMMANDS = {
     "scan": cmd_scan,
     "move": cmd_move,
     "path": cmd_path,
+    "reveal": cmd_reveal,
+    "collect": cmd_collect,   # NEW
     "recon": cmd_recon,
     "unlock": cmd_unlock,
     "trap": cmd_trap,
     "decoy": cmd_decoy,
-    "log": cmd_log,
 }
 
 # --------------------------- Pygame app -------------------------------
@@ -535,14 +673,14 @@ def build_new_game() -> GameState:
         p = Player(f"AI-{i+1}", False, starts[i + 1])
         p.discovered.add(p.current)
         players.append(p)
-    gs = GameState(nodes=nodes, edges=set(), server_id=server, players=players)
-    for nid, node in nodes.items():
-        for nb in node.neighbors:
-            if nid < nb:
-                gs.edges.add((nid, nb))
-    gs.log.append(f"Server located at node {server}. First to reach it wins.")
-    gs.log.append(f"You start at node {human.current}. Type 'help' for commands.")
+    edges = set()
+    for node in nodes.values():
+        for n in node.neighbors:
+            edges.add(tuple(sorted((node.id, n))))
+
+    gs = GameState(nodes=nodes, edges=edges, server_id=server, players=players)
     return gs
+
 
 def draw_text(surface, text, pos, font, color=FG, shadow=True):
     if shadow:
@@ -567,111 +705,224 @@ def wrap_lines(text: str, font, max_w: int) -> List[str]:
     return lines
 
 def main():
-    global W, H, SIDEBAR_W, MAP_W
 
-    pygame.init()
+   
+        global W, H, SIDEBAR_W, MAP_W
 
-    # Create a video display information object
-    infoObject = pygame.display.Info()
-    W, H = infoObject.current_w, infoObject.current_h
-    SIDEBAR_W = 420
-    MAP_W = W - SIDEBAR_W
+        pygame.init()
+        pygame.mixer.init()
 
-    screen = pygame.display.set_mode((W, H))
-    pygame.display.set_caption("Cyber Hax")
-    clock = pygame.time.Clock()
+        def play_music(path, volume=0.6, loop=-1):
+            pygame.mixer.music.stop()
+            try:
+                pygame.mixer.music.load(path)
+                pygame.mixer.music.set_volume(volume)
+                pygame.mixer.music.play(loop)
+                print(f"Playing {path}...")
+            except Exception as e:
+                print("Music load error:", e)
 
-    font = pygame.font.SysFont("consolas,menlo,monospace", FONT_SIZE)
-    title_font = pygame.font.SysFont("consolas,menlo,monospace", TITLE_FONT_SIZE, bold=True)
+        # --- Play intro music initially ---
+        play_music("intro_music.ogg")
+        # ---------- Music Setup ----------
+        
+        try:
+            pygame.mixer.music.load("D:\Projects\Cyber\Cyber-Hax-v3\Cyber_Music.ogg")
+            pygame.mixer.music.set_volume(0.6)
+            pygame.mixer.music.play(-1)
+            print("Music started...")
+        except Exception as e:
+            print("Music load error:", e)
 
-    screen_mode = "start"
-    gs = build_new_game()
-    term = Terminal(capacity=800)
 
-    ais = [RivalAI(p) for p in gs.players if not p.is_human]
-    booklet_scroll = 0
+        # setup display
+        screen = pygame.display.set_mode((W, H), pygame.RESIZABLE)
+        pygame.display.set_caption("Cyber Hax")
+        clock = pygame.time.Clock()
 
-    # welcome lines
-    term.add(">>> CYBER HAX – Network breach simulation <<<")
-    term.add("Type 'help' for available commands.")
-    term.add("Goal: reach and hack the SERVER node first.")
+        info = pygame.display.Info()
+        W, H = info.current_w, info.current_h
+        SIDEBAR_W = 420
+        MAP_W = W - SIDEBAR_W
+        screen = pygame.display.set_mode((W, H), pygame.RESIZABLE)
 
-    running = True
-    while running:
-        dt = clock.tick(FPS) / 1000.0
-        now = pygame.time.get_ticks() / 1000.0
+        font = pygame.font.SysFont("consolas,menlo,monospace", FONT_SIZE)
+        title_font = pygame.font.SysFont("consolas,menlo,monospace", TITLE_FONT_SIZE, bold=True)
 
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                running = False
+        # initialize game
+        screen_mode = "intro"
+        gs = build_new_game()
+        term = Terminal(capacity=800)
+        ais = [RivalAI(p) for p in gs.players if not p.is_human]
+        booklet_scroll = 0
+        particles = []
 
-            # mouse wheel: shift => terminal scroll, else booklet scroll
-            elif event.type == pygame.MOUSEWHEEL and screen_mode == "game":
-                if pygame.key.get_mods() & pygame.KMOD_SHIFT:
-                    # scroll terminal: event.y positive = scroll up (newer) usually; invert for our scroll()
-                    term.scroll(event.y * 3)
-                else:
-                    booklet_scroll -= event.y * 28
-                    # clamp based on an estimated maximum (we compute precise in draw)
-                    booklet_scroll = max(0, booklet_scroll)
+        term.add(">>> CYBER HAX – Network breach simulation <<<")
+        term.add("Type 'help' for available commands.")
+        term.add("Goal: reach and hack the SERVER node first.")
 
-            elif event.type == pygame.KEYDOWN:
-                if screen_mode == "start":
-                    if event.key in (pygame.K_RETURN, pygame.K_SPACE):
-                        screen_mode = "game"
-                elif screen_mode == "game":
-                    # Booklet scroll keys
-                    if event.key == pygame.K_PAGEUP:
-                        booklet_scroll = max(0, booklet_scroll - 120)
-                    elif event.key == pygame.K_PAGEDOWN:
-                        booklet_scroll = booklet_scroll + 120
-                    # history recall
-                    elif event.key == pygame.K_UP:
-                        term.recall_prev()
-                    elif event.key == pygame.K_DOWN:
-                        term.recall_next()
-                    # terminal editing
-                    elif event.key == pygame.K_BACKSPACE:
-                        term.input = term.input[:-1]
-                    elif event.key == pygame.K_RETURN:
-                        line = term.input.strip()
-                        if line:
-                            term.add("> " + line)
-                            term.history.append(line)
-                            term.history_index = -1
-                            handle_command(line, gs, term)
-                        term.input = ""
-                    elif event.key == pygame.K_TAB:
-                        term.add("Tip: 'help' shows all commands.")
-                    elif event.key == pygame.K_ESCAPE:
-                        running = False
-                    else:
-                        if event.unicode and event.unicode.isprintable():
-                            term.input += event.unicode
+        # ---------------- Intro typing animation ----------------
+        # Intro display
+        abort_intro = False
+        y = 60  # Start y-position near top
+        line_gap = 40  # Vertical gap between lines
 
-            elif event.type == pygame.MOUSEBUTTONDOWN and screen_mode == "start":
-                screen_mode = "game"
+        for line in INTRO_LINES:
+            typed = ""
+            char_index = 0
+            last_time = pygame.time.get_ticks()
 
-        term.tick(dt)
+            while char_index < len(line):
+                now = pygame.time.get_ticks()
 
-        # AI update (tick)
-        if screen_mode == "game" and not gs.winner:
-            for ai in ais:
-                ai.update(gs, dt, now)
+                # Handle events
+                for ev in pygame.event.get():
+                    if ev.type == pygame.QUIT:
+                        pygame.quit()
+                        sys.exit()
+                    if ev.type == pygame.KEYDOWN or ev.type == pygame.MOUSEBUTTONDOWN:
+                        abort_intro = True
 
-        # Draw
-        screen.fill(BG)
-        if screen_mode == "start":
-            draw_text(screen, "CYBER HAX", (W//2 - 140, H//2 - 80), title_font, ACCENT)
-            draw_text(screen, "A terminal-driven race to breach the ship's server.", (W//2 - 300, H//2 - 28), font, MUTED)
-            draw_text(screen, "Press Enter / Space / Click to begin", (W//2 - 160, H//2 + 40), font, MUTED)
-        else:
-            draw_game(screen, font, title_font, gs, term, booklet_scroll)
+                if abort_intro:
+                    break
+
+                # Add next character every 1ms
+                if now - last_time >= 25:
+                    typed += line[char_index]
+                    char_index += 1
+                    last_time = now
+
+                # Clear line area and draw text
+                screen.fill(BG, (0, y, W, line_gap))
+                draw_text(screen, typed, (20, y), title_font, ACCENT)  # 20px padding from left
+                pygame.display.flip()
+
+                # --- Update and Draw Particles ---
+            for p in particles[:]:
+                p.update()
+                p.draw(screen)
+                if p.alpha <= 0:
+                    particles.remove(p)
+
+
+            if abort_intro:
+                break
+
+            # Move to next line
+            y += line_gap
+            pygame.time.delay(100)  # short pause between lines
+
+        # After intro or if skipped, go to start screen
+        screen_mode = "start"
 
         pygame.display.flip()
+        pygame.time.delay(500)
 
-    pygame.quit()
-    sys.exit()
+
+        running = True
+
+        while running:
+            
+                    # Spawn random particles near center or mouse
+            if random.random() < 0.2:  # controls density of effect
+                mx, my = pygame.mouse.get_pos()
+                particles.append(Particle(mx, my))
+    
+            dt = clock.tick(FPS) / 1000.0
+            now = pygame.time.get_ticks() / 1000.0
+
+            # -------------- Events --------------
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
+                elif event.type == pygame.VIDEORESIZE:
+                    W, H = event.w, event.h
+                    MAP_W = W - SIDEBAR_W
+                    screen = pygame.display.set_mode((W, H), pygame.RESIZABLE)
+                elif event.type == pygame.KEYDOWN:
+                    if screen_mode == "start":
+                        play_music("D:\Projects\Cyber\Cyber-Hax-v3\Cyber_Music.ogg")
+                        if event.key in (pygame.K_RETURN, pygame.K_SPACE):
+                            screen_mode = "game"
+                    elif screen_mode == "game":
+                        if event.key == pygame.K_PAGEUP:
+                            booklet_scroll = max(0, booklet_scroll - 120)
+                        elif event.key == pygame.K_PAGEDOWN:
+                            booklet_scroll += 120
+                        elif event.key == pygame.K_UP:
+                            term.recall_prev()
+                        elif event.key == pygame.K_DOWN:
+                            term.recall_next()
+                        elif event.key == pygame.K_BACKSPACE:
+                            term.input = term.input[:-1]
+                        elif event.key == pygame.K_RETURN:
+                            line = term.input.strip()
+                            if line:
+                                term.add("> " + line)
+                                term.history.append(line)
+                                term.history_index = -1
+                                handle_command(line, gs, term)
+                            term.input = ""
+                        elif event.key == pygame.K_ESCAPE:
+                            running = False
+                        elif event.unicode and event.unicode.isprintable():
+                            term.input += event.unicode
+                elif event.type == pygame.MOUSEBUTTONDOWN and screen_mode == "start":
+                    screen_mode = "game"
+                elif event.type == pygame.MOUSEWHEEL and screen_mode == "game":
+                    if pygame.key.get_mods() & pygame.KMOD_SHIFT:
+                        term.scroll(event.y * 3)
+                    else:
+                        booklet_scroll -= event.y * 28
+                        booklet_scroll = max(0, booklet_scroll)
+
+            # -------------- Logic --------------
+            term.tick(dt)
+            if random.random() < 0.35:
+                particles.append(Particle(random.randint(0, max(1, MAP_W - 1)), H - 10))
+
+            for p in particles[:]:
+                p.update()
+                if p.alpha <= 0:
+                    particles.remove(p)
+
+            if screen_mode == "game" and not gs.winner:
+                for ai in ais:
+                    ai.update(gs, dt, now)
+
+            # -------------- Draw --------------
+            screen.fill(BG)
+
+            pulse = pygame.time.get_ticks() / 300.0  # time-based pulse
+            for nid, node in gs.nodes.items():
+                x, y = node.pos
+            if node.server:
+                draw_node(screen, x, y, SERVER_COL, pulse)
+            elif node.locked:
+                draw_node(screen, x, y, LOCKED_COL, pulse)
+            elif node.mine:
+                draw_node(screen, x, y, MINE_COL, pulse)
+            else:
+                draw_node(screen, x, y, FG, pulse)
+
+
+            for p in particles:
+                p.draw(screen)
+
+            if screen_mode == "start":
+                draw_text(screen, "CYBER HAX", (W // 2 - 140, H // 2 - 80), title_font, ACCENT)
+                draw_text(screen, "A terminal-driven race to breach the ship's server.",
+                        (W // 2 - 300, H // 2 - 28), font, MUTED)
+                draw_text(screen, "Press Enter / Space / Click to begin",
+                        (W // 2 - 220, H // 2 + 40), font, MUTED)
+            else:
+                draw_game(screen, font, title_font, gs, term, booklet_scroll)
+
+            pygame.display.flip()
+
+        pygame.quit()
+        sys.exit()
+
 
 def draw_game(screen, font, title_font, gs: GameState, term: Terminal, booklet_scroll: int):
     # Panels
@@ -690,7 +941,7 @@ def draw_game(screen, font, title_font, gs: GameState, term: Terminal, booklet_s
         if a in disc and b in disc:
             pa = gs.nodes[a].pos
             pb = gs.nodes[b].pos
-            pygame.draw.line(screen, (70, 80, 100), pa, pb, EDGE_THICKNESS)
+            pygame.draw.line(screen, (150, 150, 200), pa, pb, EDGE_THICKNESS)
 
     # nodes (discovered)
     for nid in sorted(disc):
@@ -708,12 +959,16 @@ def draw_game(screen, font, title_font, gs: GameState, term: Terminal, booklet_s
             col = LOCKED_COL
         elif node.mine:
             col = MINE_COL
-        pygame.draw.circle(screen, col, (x,y), r)
+        pulse = pygame.time.get_ticks() / 300  # or another scale
+        draw_node(screen, x, y, col, pulse)
+
         pygame.draw.circle(screen, (20,24,32), (x,y), r, 1)
         label = font.render(str(nid), True, (230,230,240))
         screen.blit(label, (x - label.get_width()//2, y - r - label.get_height()))
 
     # Booklet (scrollable)
+
+
     pygame.draw.rect(screen, (20,24,32), booklet_rect)
     pygame.draw.rect(screen, (35,40,50), booklet_rect, 1)
     draw_text(screen, "Command Booklet", (booklet_rect.x + 12, booklet_rect.y + 10), title_font, ACCENT)
